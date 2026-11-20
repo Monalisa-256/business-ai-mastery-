@@ -1,24 +1,32 @@
-name: Extract uploaded ZIP archives
+name: Extract ZIP archives into repository
 
 on:
   push:
+    branches:
+      - main
     paths:
+      - '*.[zZ][iI][pP]'
       - 'uploads/**'
+      - '.github/workflows/extract-zips.yml'
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: zip-import-${{ github.ref }}
+  group: zip-extraction-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   import:
-    name: Extract ZIP contents into repository root
+    name: Import ZIPs from repository root or uploads
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+
     steps:
-      - name: Check out the current branch
+      - name: Check out the branch
         uses: actions/checkout@v4
         with:
           persist-credentials: true
@@ -28,28 +36,69 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Test extractor
+      - name: Verify extractor tests
         run: python -m unittest discover -s tests -v
 
-      - name: Extract all uploaded ZIP files
-        run: >-
-          python tools/extract_zips.py
-          --all
-          --source uploads
-          --dest .
-          --strip-wrapper auto
-          --on-conflict replace
-          --delete-archives
-
-      - name: Commit extracted files and remove processed archives
+      - name: Locate ZIP archives in the root and uploads folder
         shell: bash
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
+          shopt -s nullglob nocaseglob
+          mkdir -p uploads
+
+          # A ZIP uploaded at the repo root is moved to the supported inbox.
+          # Quoting preserves filenames that contain spaces or punctuation.
+          archives=(./*.zip)
+          for archive in "${archives[@]}"; do
+            filename="${archive#./}"
+            target="uploads/$filename"
+            if [[ -e "$target" ]]; then
+              echo "::error::Duplicate ZIP filename in root and uploads: $filename"
+              exit 1
+            fi
+            mv -- "$archive" "$target"
+            echo "Queued: $filename"
+          done
+
+          count="$(find uploads -type f -iname '*.zip' | wc -l | tr -d ' ')"
+          echo "ARCHIVE_COUNT=$count" >> "$GITHUB_ENV"
+          echo "ZIP archives discovered: $count"
+          if [[ "$count" == 0 ]]; then
+            echo '::notice::No ZIP archives found. Upload a ZIP to the repo root or uploads/ and retry.'
+          fi
+
+      - name: Preview and validate the extraction
+        if: env.ARCHIVE_COUNT != '0'
+        run: |
+          python tools/extract_zips.py \
+            --all --source uploads --dest . \
+            --strip-wrapper auto --on-conflict replace --dry-run
+
+      - name: Extract ZIPs and remove processed archives
+        if: env.ARCHIVE_COUNT != '0'
+        run: |
+          python tools/extract_zips.py \
+            --all --source uploads --dest . \
+            --strip-wrapper auto --on-conflict replace --delete-archives
+
+      - name: Commit imported files to the current branch
+        if: env.ARCHIVE_COUNT != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
           if git diff --cached --quiet; then
-            echo "No changes to commit."
-            exit 0
+            echo 'All extracted files were already identical. No commit required.'
+          else
+            git diff --cached --stat
+            git commit -m 'Import ZIP course content into repository'
+            git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-          git commit -m "Import contents of uploaded ZIP archives"
-          git push origin "HEAD:${GITHUB_REF#refs/heads/}"
+          {
+            echo '### ZIP extraction result'
+            echo "Processed $ARCHIVE_COUNT archive(s)."
+            echo 'Validated and imported into the repository root, without extra ZIP wrapper folders.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          
